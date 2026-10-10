@@ -1,0 +1,188 @@
+# ev-sync-upstream — 上流(Prowlarr/Prowlarr)の新しい安定版を見つけて、このフォークに取り込む。
+#
+# このフォーク(y-ytakahashi/Prowlarr)の使い方は FORK.md。要点:
+#   master / develop … 上流の写し(fast-forward だけ。ここにはコミットしない)
+#   custom           … 既定ブランチ。上流の安定版タグ(vX.Y.Z.N)の上に自分の変更(インデクサ定義・機能)を積む。
+#                      新しい安定版は `git merge --no-ff <tag>` で取り込む(rebase はしない = force push しない)
+#
+# 6 時間ごと(と手動)に:
+#   1. 上流の最新の安定版を調べる(GitHub Releases の latest = prerelease でも draft でもない最新。
+#      上流は develop からの pre-release も同じ Releases に出すので、タグの新しさではなく latest を見る)
+#   2. master / develop を上流に合わせる(fast-forward できなければ止めて Issue を立てる)
+#   3. そのタグが custom に取り込み済みなら、ここで終わる
+#   4. custom にタグをマージする。衝突したら何も push せずに止め、Issue を立てる(解き方は FORK.md)
+#   5. push する(force は使わない。別の人の push と競合したら失敗して、次の回にやり直す)
+# イメージのビルドは enter-viewer 側(.github/workflows/build-prowlarr.yml、self-hosted runner)が custom の HEAD を見て行う。
+# ここでは GitHub のホストランナーで git 操作だけをする(self-hosted runner は public リポジトリに付けない)。
+#
+# 通知: Issue を立てる(ラベル ev-sync。同じタグの Issue が開いていればコメントで足す)。
+#   リポジトリの secret NTFY_URL(例: https://ntfy.sh/<topic>)があれば、同じ文を POST する(無ければ Issue だけ)。
+name: ev-sync-upstream
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "push も Issue も作らず、何が起きるかだけ出す"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: ev-sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: Prowlarr/Prowlarr
+  WORK_BRANCH: custom
+  DRY_RUN: ${{ inputs.dry_run == true && '1' || '0' }}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: custom
+          fetch-depth: 0
+
+      - name: 上流を取り込む準備
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM}.git"
+          git fetch --no-tags upstream master develop
+          git fetch upstream --tags
+
+      - name: 上流の最新の安定版
+        id: latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="$(gh api "repos/${UPSTREAM}/releases/latest" --jq '.tag_name')"
+          echo "$tag" | grep -Eq '^v[0-9]+(\.[0-9]+){3}$' || { echo "::error::安定版のタグの形が想定外: $tag"; exit 1; }
+          git rev-parse -q --verify "refs/tags/${tag}^{commit}" >/dev/null || { echo "::error::タグ $tag が上流に無い"; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "refs/tags/${tag}" HEAD; then
+            echo "custom は $tag を取り込み済み"
+            echo "contained=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "custom に $tag が無い(取り込む)"
+            echo "contained=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: master / develop を上流に合わせる(fast-forward だけ)
+        id: mirror
+        run: |
+          set -euo pipefail
+          failed=""
+          for b in master develop; do
+            if [ "$DRY_RUN" = "1" ]; then
+              echo "(dry run) push origin upstream/$b -> $b"
+              git push --dry-run origin "refs/remotes/upstream/$b:refs/heads/$b" || failed="$failed $b"
+            elif ! git push origin "refs/remotes/upstream/$b:refs/heads/$b"; then
+              failed="$failed $b"
+            fi
+          done
+          if [ "$DRY_RUN" != "1" ]; then
+            git push origin "refs/tags/${{ steps.latest.outputs.tag }}" || true
+          fi
+          echo "failed=${failed# }" >> "$GITHUB_OUTPUT"
+          if [ -n "$failed" ]; then
+            echo "::error::fast-forward できないブランチ:$failed(このフォークの master / develop にコミットが入っている。FORK.md)"
+          fi
+
+      - name: custom にマージする
+        id: merge
+        if: steps.latest.outputs.contained == 'false' && steps.mirror.outputs.failed == ''
+        run: |
+          set -euo pipefail
+          tag="${{ steps.latest.outputs.tag }}"
+          before="$(git rev-parse HEAD)"
+          if git merge --no-ff --no-edit -m "chore(sync): 上流の ${tag} を custom に取り込む" "refs/tags/${tag}"; then
+            echo "merged=true" >> "$GITHUB_OUTPUT"
+            git log --oneline "${before}..HEAD" | head -5
+            if [ "$DRY_RUN" = "1" ]; then
+              echo "(dry run) push しない"
+              git push --dry-run origin "HEAD:${WORK_BRANCH}"
+            else
+              git push origin "HEAD:${WORK_BRANCH}"
+            fi
+          else
+            {
+              echo "conflicts<<EOF"
+              git diff --name-only --diff-filter=U
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            git merge --abort
+            echo "merged=false" >> "$GITHUB_OUTPUT"
+            echo "::error::${tag} のマージで衝突した。何も push していない"
+          fi
+
+      - name: 止まったら Issue で知らせる
+        if: always() && steps.latest.outputs.tag != '' && (steps.mirror.outputs.failed != '' || steps.merge.outputs.merged == 'false')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.latest.outputs.tag }}
+          MIRROR_FAILED: ${{ steps.mirror.outputs.failed }}
+          CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          NTFY_URL: ${{ secrets.NTFY_URL }}
+        run: |
+          set -euo pipefail
+          if [ -n "$MIRROR_FAILED" ]; then
+            title="ev-sync: master / develop を上流に合わせられない($MIRROR_FAILED)"
+            body="$(printf '%s\n' \
+              "上流 ${UPSTREAM} の ${MIRROR_FAILED} を fast-forward で push できなかった。" \
+              "このフォークの master / develop は上流の写しで、コミットを入れない決まり(FORK.md)。" \
+              "入れてしまった変更は custom に移し、master / develop を上流に戻す:" \
+              '```' \
+              "git fetch upstream && git push --force-with-lease origin upstream/master:master" \
+              '```' \
+              "" \
+              "実行: ${RUN_URL}")"
+          else
+            title="ev-sync: 上流 ${TAG} を custom に取り込めない(衝突)"
+            body="$(printf '%s\n' \
+              "上流 ${UPSTREAM} の安定版 ${TAG} を custom にマージしたら衝突した。何も push していない。" \
+              "" \
+              "衝突したファイル:" \
+              '```' \
+              "${CONFLICTS}" \
+              '```' \
+              "" \
+              "手で取り込む(FORK.md「衝突したとき」):" \
+              '```' \
+              "git fetch upstream --tags && git checkout custom && git pull --ff-only" \
+              "git merge --no-ff ${TAG}   # 衝突を直して commit" \
+              "git push origin custom      # force は使わない" \
+              '```' \
+              "次の回の ev-sync は、${TAG} が custom に入っていれば何もしない。" \
+              "" \
+              "実行: ${RUN_URL}")"
+          fi
+          if [ "$DRY_RUN" = "1" ]; then
+            echo "(dry run) Issue: $title"; printf '%s\n' "$body"; exit 1
+          fi
+          gh label create ev-sync --color D93F0B --description "enter-viewer: upstream 同期の自動 Issue" --force >/dev/null 2>&1 || true
+          existing="$(gh issue list --label ev-sync --state open --search "\"${TAG}\" in:title" --json number,title --jq '.[0].number')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "再び止まった。${RUN_URL}"
+            url="$(gh issue view "$existing" --json url --jq .url)"
+          else
+            url="$(gh issue create --title "$title" --label ev-sync --body "$body")"
+          fi
+          echo "issue: $url"
+          if [ -n "$NTFY_URL" ]; then
+            curl -fsS -m 10 -H "Title: Prowlarr fork: upstream sync stopped" \
+              -d "$(printf '%s\n%s' "$title" "$url")" "$NTFY_URL" >/dev/null || echo "::warning::ntfy に送れなかった"
+          fi
+          exit 1
